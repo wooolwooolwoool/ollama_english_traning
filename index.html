@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>English Lesson</title>
+<style>
+body {
+    font-family: sans-serif;
+    max-width: 600px;
+    margin: auto;
+}
+.chat {
+    border: 1px solid #ccc;
+    padding: 10px;
+    height: 400px;
+    overflow-y: auto;
+}
+.msg {
+    margin: 8px 0;
+}
+.user {
+    text-align: right;
+}
+.ai {
+    text-align: left;
+    color: blue;
+}
+button {
+    width: 100%;
+    height: 50px;
+    margin-top: 10px;
+    font-size: 16px;
+}
+.icon-btn {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    border: none;
+    cursor: pointer;
+    font-size: 16px;
+    background: #eee;
+}
+
+.icon-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+</style>
+</head>
+<body>
+
+<h2>English Lesson</h2>
+
+<div class="chat" id="chat"></div>
+
+<div style="display:flex; gap:6px; margin-top:10px; align-items:center;">
+  <input id="textInput" type="text"
+    style="flex:1; height:36px; padding:0 8px;"
+    placeholder="Answer in English..." />
+
+  <button id="send" class="icon-btn">➤</button>
+  <button id="rec" class="icon-btn">🎤</button>
+</div>
+
+<button id="retry">Retry</button>
+<button id="reset">Reset Lesson</button>
+<script>
+let audioContext = null;
+let processor;
+let input;
+let stream;
+let audioData = [];
+
+const chat = document.getElementById("chat");
+const btn = document.getElementById("rec");
+const sendBtn = document.getElementById("send");
+const textInput = document.getElementById("textInput");
+
+
+btn.onclick = async () => {
+    if (!audioContext) {
+        setLoading(true);
+
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        audioContext = new AudioContext({ sampleRate: 16000 });
+
+        input = audioContext.createMediaStreamSource(stream);
+        processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+        input.connect(processor);
+        processor.connect(audioContext.destination);
+
+        audioData = [];
+
+        processor.onaudioprocess = (e) => {
+            const channel = e.inputBuffer.getChannelData(0);
+            audioData.push(new Float32Array(channel));
+        };
+
+        btn.innerText = "■"; // 録音中アイコン
+        btn.disabled = false;
+
+    } else {
+        processor.disconnect();
+        input.disconnect();
+        stream.getTracks().forEach(track => track.stop());
+
+        const wavBlob = encodeWAV(audioData, 16000);
+        audioContext = null;
+
+        btn.innerText = "🎤";
+        btn.disabled = true;
+        await sendAudio(wavBlob);
+        setLoading(false);
+    }
+};
+
+const retryBtn = document.getElementById("retry");
+
+retryBtn.onclick = () => {
+    // 録音中なら停止
+    if (audioContext) {
+        processor.disconnect();
+        input.disconnect();
+        stream.getTracks().forEach(track => track.stop());
+        audioContext = null;
+    }
+
+    audioData = [];
+    btn.innerText = "🎤";
+    setLoading(false);
+};
+
+// --- WAVエンコード ---
+function encodeWAV(samples, sampleRate) {
+    let length = samples.reduce((acc, cur) => acc + cur.length, 0);
+    let buffer = new ArrayBuffer(44 + length * 2);
+    let view = new DataView(buffer);
+
+    let offset = 0;
+
+    function writeString(s) {
+        for (let i = 0; i < s.length; i++) {
+            view.setUint8(offset++, s.charCodeAt(i));
+        }
+    }
+
+    writeString("RIFF");
+    view.setUint32(offset, 36 + length * 2, true); offset += 4;
+    writeString("WAVE");
+    writeString("fmt ");
+    view.setUint32(offset, 16, true); offset += 4;
+    view.setUint16(offset, 1, true); offset += 2; // PCM
+    view.setUint16(offset, 1, true); offset += 2; // mono
+    view.setUint32(offset, sampleRate, true); offset += 4;
+    view.setUint32(offset, sampleRate * 2, true); offset += 4;
+    view.setUint16(offset, 2, true); offset += 2;
+    view.setUint16(offset, 16, true); offset += 2;
+    writeString("data");
+    view.setUint32(offset, length * 2, true); offset += 4;
+
+    let pos = 0;
+    for (let s of samples) {
+        for (let i = 0; i < s.length; i++, pos += 2) {
+            let val = Math.max(-1, Math.min(1, s[i]));
+            view.setInt16(44 + pos, val * 0x7fff, true);
+        }
+    }
+
+    return new Blob([view], { type: "audio/wav" });
+}
+
+// --- API送信 ---
+async function sendAudio(blob) {
+    try {
+        const form = new FormData();
+        form.append("file", blob, "voice.wav");
+
+        const res = await fetch("/api/voice", {
+            method: "POST",
+            body: form
+        });
+
+        const data = await res.json();
+
+        addMessage("You: " + data.user, "user");
+        addMessage("Correction: " + data.correction, "ai");
+        addMessage("Explanation: " + data.explanation, "ai");
+        addMessage("Next: " + data.next_question, "ai");
+
+        playAudio(data.audio_url);
+
+    } finally {
+        setLoading(false);
+    }
+}
+
+// --- UI表示 ---
+function addMessage(text, cls) {
+    const div = document.createElement("div");
+    div.className = "msg " + cls;
+    div.innerText = text;
+    chat.appendChild(div);
+    chat.scrollTop = chat.scrollHeight;
+}
+
+// --- 音声再生 ---
+function playAudio(url) {
+    const audio = new Audio(url + "?t=" + Date.now());
+    audio.play();
+}
+
+function setLoading(isLoading) {
+    sendBtn.disabled = isLoading;
+    btn.disabled = isLoading;
+}
+
+async function sendText() {
+    const text = textInput.value.trim();
+    if (!text) return;
+
+    setLoading(true);
+
+    try {
+        const res = await fetch("/api/text", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({ text })
+        });
+
+        const data = await res.json();
+
+        addMessage("You: " + data.user, "user");
+        addMessage("Correction: " + data.correction, "ai");
+        addMessage("Explanation: " + data.explanation, "ai");
+        addMessage("Next: " + data.next_question, "ai");
+
+        playAudio(data.audio_url);
+        textInput.value = "";
+
+    } finally {
+        setLoading(false);
+    }
+}
+
+// 初期メッセージ
+addMessage("AI: What topic should we talk about today?", "ai");
+
+const resetBtn = document.getElementById("reset");
+
+resetBtn.onclick = async () => {
+    await fetch("/api/reset", { method: "POST" });
+
+    // UIリセット
+    chat.innerHTML = "";
+    addMessage("AI: What topic should we talk about today?", "ai");
+};
+
+sendBtn.onclick = sendText;
+textInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") sendText();
+});
+
+</script>
+
+</body>
+</html>
