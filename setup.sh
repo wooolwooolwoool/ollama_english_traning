@@ -1,7 +1,5 @@
-
 # Ubuntu
-sudo apt install -y ffmpeg
-pip install fastapi uvicorn faster-whisper python-multipart piper-tts
+pip install fastapi uvicorn faster-whisper python-multipart piper-tts soundfile
 ollama pull llama3.1:8B
 mkdir models
 cd models

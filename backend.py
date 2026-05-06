@@ -1,26 +1,31 @@
 from fastapi import Body, FastAPI, UploadFile, File
 from fastapi.responses import HTMLResponse, FileResponse
-import subprocess
 import json
 import shutil
 from faster_whisper import WhisperModel
 import os
 import requests
 import datetime
+import copy
+from piper import PiperVoice
+import soundfile as sf
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
-
+MODEL_PATH = "models/en_US-lessac-low.onnx"
 app = FastAPI()
 
-# Whisper
+# STT
 model = WhisperModel("base", compute_type="int8")
+# TTS
+voice = PiperVoice.load(MODEL_PATH)
 
 summary = {
     "topic": "",
-    "conversation_flow": "",
-    "user_level": "C"
+    "conversation_flow": ""
 }
 last_question = "What topic should we talk about today?"
+last_state = None
+last_question = "What did you do yesterday?"
 
 PROMPT = """
 You are an English tutor.
@@ -38,6 +43,7 @@ IMPORTANT RULES:
 - The next question must naturally follow the conversation flow
 - Ask 2 to 3 short sentences for the next question (not too long)
 - Focus on grammar and word usage
+- If there is correct syntax, teach it
 - Keep explanations short and clear in English
 - Use simple and natural English
 - When someone suggests changing the topic, change the summary
@@ -53,8 +59,7 @@ STRICT OUTPUT RULES:
   "next_question": "...",
   "summary": {
     "topic": "...",
-    "conversation_flow": "...",
-    "user_level": "..."
+    "conversation_flow": "..."
   }
 }
 """
@@ -87,54 +92,59 @@ User: {text}
             "prompt": prompt,
             "stream": False
         },
-        timeout=60
+        timeout=180
     )
 
     return response.json()["response"]
 
 # --- TTS ---
 def tts(text, output="reply.wav"):
-    subprocess.run([
-        "piper",
-        "--model", "models/en_US-lessac-low.onnx",
-        "--output_file", output
-    ], input=text, text=True)
+    audio = []
+    sample_rate = voice.config.sample_rate
+    for chunk in voice.synthesize(text):
+        audio.extend(chunk.audio_float_array)
+    sf.write(output, audio, sample_rate)
 
-@app.post("/api/voice")
-async def voice(file: UploadFile = File(...)):
-    with open("input.wav", "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    print(f"{datetime.datetime.now()} - Received voice input: {file.filename}")
-    user_text = transcribe("input.wav")
-    print(f"{datetime.datetime.now()} - Transcribed text: {user_text}")
-    raw = ask_llm(user_text)
-    print(f"{datetime.datetime.now()} - Generated text: {raw}")
-
+def process_text(user_text):
     try:
+        raw = ask_llm(user_text)
+        print(f"{datetime.datetime.now()} - Generated text: {raw}")
+
+        global last_question, last_state, summary
         data = json.loads(raw)
+        last_state = {
+            "summary": copy.deepcopy(summary),
+            "question": copy.deepcopy(last_question)
+        }
+        summary.update(data["summary"])
+        last_question = data["next_question"]
     except:
         data = {
             "correction": user_text,
             "explanation": "Failed to parse LLM response.",
             "next_question": "Can you try again?",
-            "summary": {
-                "topic": "",
-                "conversation_flow": "",
-                "user_level": ""
-            }
+            "summary": summary
         }
-
-    summary.update(data["summary"])
-    global last_question
-    last_question = data["next_question"]
     # TTS生成
     tts(data["explanation"] + " " + data["next_question"], "reply.wav")
+    audio_url = "/audio/reply.wav"
+
 
     return {
         "user": user_text,
         **data,
-        "audio_url": "/audio/reply.wav"
+        "audio_url": audio_url
     }
+
+@app.post("/api/voice")
+async def voice_api(file: UploadFile = File(...)):
+    with open("input.wav", "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    print(f"{datetime.datetime.now()} - Received voice input: {file.filename}")
+    user_text = transcribe("input.wav")
+    print(f"{datetime.datetime.now()} - Transcribed text: {user_text}")
+    return process_text(user_text)
+
 
 @app.get("/audio/{filename}")
 def get_audio(filename: str):
@@ -145,41 +155,37 @@ def get_audio(filename: str):
 @app.post("/api/text")
 async def text_api(data: dict = Body(...)):
     user_text = data.get("text", "")
-
-    raw = ask_llm(user_text)
-
-    try:
-        result = json.loads(raw)
-    except:
-        result = {
-            "correction": user_text,
-            "explanation": "Failed to parse LLM response.",
-            "next_question": "Can you try again?"
-        }
-
-    # サマリ更新
-    global summary
-    summary.update(result.get("summary", {}))
-
-    # TTS
-    tts(result["next_question"], "reply.wav")
-
-    return {
-        "user": user_text,
-        **result,
-        "audio_url": "/audio/reply.wav"
-    }
+    return process_text(user_text)
 
 @app.post("/api/reset")
 def reset():
-    global history, summary, last_question
+    global summary, last_question
     summary = {
         "topic": "",
-        "conversation_flow": "",
-        "user_level": "C"
+        "conversation_flow": ""
     }
     last_question = "What topic should we talk about today?"
     return {"status": "ok"}
+
+@app.post("/api/back")
+def go_back():
+    global summary, last_question, last_state
+
+    if not last_state:
+        return {"status": "no_history"}
+
+    summary = last_state["summary"]
+    last_question = last_state["question"]
+    print(f"{datetime.datetime.now()} - Back to : {summary}")
+    print(f"{datetime.datetime.now()} - Back to : {last_question}")
+
+    # 一回だけ戻れるようにする
+    last_state = None
+
+    return {
+        "status": "ok",
+        "question": last_question
+    }
 
 @app.get("/")
 def index():
